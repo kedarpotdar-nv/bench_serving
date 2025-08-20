@@ -371,17 +371,22 @@ def sample_random_requests(
     range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
     use_chat_template: bool = False,
+    dry_run: bool = False,
 ) -> List[Tuple[str, int, int]]:
     prefix_token_ids = np.random.randint(0,
                                          tokenizer.vocab_size,
                                          size=prefix_len).tolist()
     if use_chat_template:
         chat_template_dummy = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "a"}],
+            [{
+                "role": "user",
+                "content": "a"
+            }],
             add_generation_prompt=True,
             tokenize=False,
         )
-        tokenized_chat_template_dummy = tokenizer.encode(chat_template_dummy, add_special_tokens=False)
+        tokenized_chat_template_dummy = tokenizer.encode(
+            chat_template_dummy, add_special_tokens=False)
         chat_template_len = len(tokenized_chat_template_dummy) - 1
         input_len = input_len - chat_template_len
 
@@ -397,24 +402,62 @@ def sample_random_requests(
     )
     offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
     input_requests = []
+    input_lens_list = []
+    server_input_lens_list = []
     for i in range(num_prompts):
         prompt = tokenizer.decode(prefix_token_ids +
                                   [(offsets[i] + i + j) % tokenizer.vocab_size
                                    for j in range(input_lens[i])])
-        re_encoded_sequence = tokenizer.encode(prompt, add_special_tokens=False)[
-                :(prefix_len + input_lens[i])
-            ]
+        re_encoded_sequence = tokenizer.encode(
+            prompt, add_special_tokens=False)[:(prefix_len + input_lens[i])]
         prompt = tokenizer.decode(re_encoded_sequence)
         if use_chat_template:
             prompt = tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
+                [{
+                    "role": "user",
+                    "content": prompt
+                }],
                 add_generation_prompt=True,
                 tokenize=False,
             )
             input_lens[i] += chat_template_len
 
+        if dry_run:
+            input_lens_list.append(prefix_len + input_lens[i])
+            server_input_lens_list.append(len(tokenizer(prompt).input_ids))
+
         input_requests.append((prompt, int(prefix_len + input_lens[i]),
                                int(output_lens[i]), None))
+
+    if dry_run:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10, 5))
+
+        plt.hist(
+            server_input_lens_list,
+            bins=range(min(server_input_lens_list + input_lens_list),
+                       max(server_input_lens_list + input_lens_list) + 10, 10),
+            alpha=0.7,
+            label='Server Input Length',
+            color='#FF6B6B',  # red
+            edgecolor='black')
+        plt.hist(
+            input_lens_list,
+            bins=range(min(server_input_lens_list + input_lens_list),
+                       max(server_input_lens_list + input_lens_list) + 10, 10),
+            alpha=0.7,
+            label='Client Input Length',
+            color='#4ECDC4',  # green
+            edgecolor='black')
+        plt.xlabel('Length')
+        plt.ylabel('Frequency')
+        plt.title('Distribution of Input Lengths')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(
+            f"dry_run_num_prompts_{num_prompts}_{tokenizer.name_or_path}.png".
+            replace("/", "-"))
+        plt.close()
 
     return input_requests
 
@@ -967,10 +1010,15 @@ def main(args: argparse.Namespace):
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
             use_chat_template=args.use_chat_template,
+            dry_run=args.dry_run,
         )
 
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
+
+    if args.dry_run:
+        print(f"Dry run the benchmark with {len(input_requests)} requests.")
+        return
 
     goodput_config_dict = check_goodput_args(args)
 
@@ -1352,6 +1400,10 @@ if __name__ == "__main__":
                         help="A subset of LoRA module names passed in when "
                         "launching the server. For each request, the "
                         "script chooses a LoRA module at random.")
+
+    parser.add_argument("--dry-run",
+                        action="store_true",
+                        help="Dry run the benchmark.")
 
     args = parser.parse_args()
     main(args)
