@@ -8,13 +8,15 @@ do
     echo "Running benchmark with concurrency: $concurrency and num-prompts: $num_prompts"
 
     python3 benchmark_serving.py \
-        --model nvidia/Llama-3.3-70B-Instruct-FP8 \
+        --model deepseek-ai/DeepSeek-R1 \
         --dataset-name random \
         --num-prompts "$num_prompts" \
         --random-input-len 1024 \
         --random-output-len 1024 \
         --random-range-ratio 0.8 \
         --ignore-eos \
+        --backend "dynamo" \
+        --endpoint "/v1/chat/completions" \
         --percentile-metrics ttft,tpot,itl,e2el \
         --max-concurrency "$concurrency"
 
