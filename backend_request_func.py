@@ -480,19 +480,9 @@ async def async_request_dynamo_chat_completions(
         "Dynamo Chat API URL must end with 'chat/completions'."
 
     headers = {"Content-Type": "application/json"}
-
-    # ⚠️ Dynamo expects plain string message content (as your curl shows).
-    # If you pass [{"type":"text","text":...}] you can trigger a 500.
     user_content = request_func_input.prompt
-    # If you truly need multimodal later, gate it behind a feature flag.
     if request_func_input.multi_modal_content:
-        # Most Dynamo frontends won't support MM yet; fall back to text-only.
         pass
-
-    # Be conservative with fields that can 500 on some frontends:
-    # - use max_tokens (widely accepted) instead of max_completion_tokens
-    # - omit stream_options
-    # - only send ignore_eos if caller asked; many backends don't support it
     payload = {
         "model": (request_func_input.model_name
                   if request_func_input.model_name else request_func_input.model),
