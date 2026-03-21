@@ -419,6 +419,79 @@ def sample_random_requests(
     return input_requests
 
 
+def sample_agent_turn_requests(
+    turn_configs: str,
+    tokenizer: PreTrainedTokenizerBase,
+) -> List[Tuple[str, int, int, None]]:
+    """Generate requests simulating an agent multi-turn conversation.
+
+    turn_configs: pipe-separated turn specs, each is "prefix_len,input_len,output_len"
+      e.g. "0,16384,128|16384,128,128|16384,4096,512"
+
+    The FIRST turn with prefix_len=0 is the cold start. Its input tokens become
+    the cached prefix for subsequent turns. All later turns with prefix_len > 0
+    reuse those exact tokens as their prefix, simulating KV cache reuse
+    (like an agent re-sending the system prompt on each turn).
+
+    No initial test run is needed — request 1 is the true cold start.
+    """
+    turns = []
+    for spec in turn_configs.split("|"):
+        parts = spec.strip().split(",")
+        if len(parts) != 3:
+            raise ValueError(
+                f"Invalid turn config '{spec}'. "
+                "Expected format: prefix_len,input_len,output_len")
+        prefix_len, input_len, output_len = int(parts[0]), int(parts[1]), int(parts[2])
+        turns.append((prefix_len, input_len, output_len))
+
+    # Find the cold start turn (prefix_len=0) — its input tokens become the
+    # shared prefix for all subsequent turns.
+    cold_turn_input_len = None
+    for prefix_len, input_len, _ in turns:
+        if prefix_len == 0:
+            cold_turn_input_len = input_len
+            break
+
+    # Generate the "system prompt" tokens that will be shared.
+    # For the cold turn, these ARE the input. For warm turns, these are the prefix.
+    max_prefix = max(t[0] for t in turns)
+    shared_prefix_len = max(max_prefix, cold_turn_input_len or 0)
+    shared_tokens = np.random.randint(
+        0, tokenizer.vocab_size, size=shared_prefix_len).tolist()
+
+    input_requests = []
+    for i, (prefix_len, input_len, output_len) in enumerate(turns):
+        if prefix_len == 0:
+            # Cold start — use the shared tokens as the full input
+            full_ids = shared_tokens[:input_len]
+        else:
+            # Warm turn — prefix is the shared tokens, suffix is unique
+            prefix_ids = shared_tokens[:prefix_len]
+            suffix_ids = [(hash((i, j)) % tokenizer.vocab_size)
+                          for j in range(input_len)]
+            full_ids = prefix_ids + suffix_ids
+
+        total_input = len(full_ids)
+
+        # Decode to text, re-encode to stabilize tokenization, truncate
+        prompt = tokenizer.decode(full_ids)
+        re_encoded = tokenizer.encode(prompt, add_special_tokens=False)[
+            :total_input]
+        prompt = tokenizer.decode(re_encoded)
+
+        input_requests.append((prompt, total_input, output_len, None))
+
+    print(f"Agent turns: {len(turns)} turns generated. "
+          f"Shared prefix: {shared_prefix_len} tokens.")
+    for i, (pl, il, ol) in enumerate(turns):
+        tag = "COLD" if pl == 0 else "WARM"
+        print(f"  Turn {i+1} ({tag}): prefix={pl}, new={il}, out={ol}, "
+              f"total_in={pl+il}")
+
+    return input_requests
+
+
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
@@ -591,39 +664,44 @@ async def benchmark(
     goodput_config_dict: Dict[str, float],
     max_concurrency: Optional[int],
     lora_modules: Optional[List[str]],
+    skip_initial_test: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len, test_mm_content = (
-        input_requests[0])
-    if backend != "openai-chat" and test_mm_content is not None:
-        # multi-modal benchmark is only available on OpenAI Chat backend.
-        raise ValueError(
-            "Multi-modal content is only supported on 'openai-chat' backend.")
-    test_input = RequestFuncInput(
-        model=model_id,
-        model_name=model_name,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        logprobs=logprobs,
-        best_of=best_of,
-        multi_modal_content=test_mm_content,
-        ignore_eos=ignore_eos,
-    )
+    if not skip_initial_test:
+        print("Starting initial single prompt test run...")
+        test_prompt, test_prompt_len, test_output_len, test_mm_content = (
+            input_requests[0])
+        if backend != "openai-chat" and test_mm_content is not None:
+            # multi-modal benchmark is only available on OpenAI Chat backend.
+            raise ValueError(
+                "Multi-modal content is only supported on 'openai-chat' backend.")
+        test_input = RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=test_prompt,
+            api_url=api_url,
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+            best_of=best_of,
+            multi_modal_content=test_mm_content,
+            ignore_eos=ignore_eos,
+        )
 
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}")
+        test_output = await request_func(request_func_input=test_input)
+        if not test_output.success:
+            raise ValueError(
+                "Initial test run failed - Please make sure benchmark arguments "
+                f"are correctly specified. Error: {test_output.error}")
+        else:
+            print("Initial test run completed. Starting main benchmark run...")
     else:
-        print("Initial test run completed. Starting main benchmark run...")
+        print("Skipping initial test run (--skip-initial-test). "
+              "Starting benchmark...")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -969,6 +1047,19 @@ def main(args: argparse.Namespace):
             use_chat_template=args.use_chat_template,
         )
 
+    elif args.dataset_name == "agent-turns":
+        if not args.turn_configs:
+            raise ValueError(
+                "--turn-configs is required for agent-turns dataset. "
+                "Format: 'prefix,input,output|prefix,input,output|...'\n"
+                "Example: '0,16384,128|16384,128,128|16384,4096,512'")
+        input_requests = sample_agent_turn_requests(
+            turn_configs=args.turn_configs,
+            tokenizer=tokenizer,
+        )
+        # Override num_prompts to match turn count
+        args.num_prompts = len(input_requests)
+
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
@@ -1001,6 +1092,7 @@ def main(args: argparse.Namespace):
             goodput_config_dict=goodput_config_dict,
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
+            skip_initial_test=getattr(args, 'skip_initial_test', False),
         ))
 
     # Save config and results to json
@@ -1085,7 +1177,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
+        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "agent-turns"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
@@ -1309,6 +1401,25 @@ if __name__ == "__main__":
         "--use-chat-template",
         action="store_true",
         help="Use chat template to format the prompt.",
+    )
+
+    agent_group = parser.add_argument_group("agent-turns dataset options")
+    agent_group.add_argument(
+        "--turn-configs",
+        type=str,
+        default=None,
+        help="Pipe-separated turn specs for agent-turns dataset. "
+        "Each turn is 'prefix_len,input_len,output_len'. "
+        "Turns with the same prefix_len share prefix tokens (KV cache reuse). "
+        "Example: '0,16384,128|16384,128,128|16384,4096,512' "
+        "(cold 16K start, then two turns with 16K cached prefix).",
+    )
+    agent_group.add_argument(
+        "--skip-initial-test",
+        action="store_true",
+        default=False,
+        help="Skip the initial single-prompt test run. Use with agent-turns "
+        "to ensure request 1 is a true cold start with no cached state.",
     )
 
     hf_group = parser.add_argument_group("hf dataset options")
