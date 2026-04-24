@@ -57,6 +57,7 @@ except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
 from benchmark_utils import convert_to_pytorch_benchmark_format
+from encoding_dsv4 import encode_messages as dsv4_encode_messages
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
@@ -371,18 +372,25 @@ def sample_random_requests(
     range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
     use_chat_template: bool = False,
+    dsv4: bool = False,
 ) -> List[Tuple[str, int, int]]:
     prefix_token_ids = np.random.randint(0,
                                          tokenizer.vocab_size,
                                          size=prefix_len).tolist()
     if use_chat_template:
-        chat_template_dummy = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "a"}],
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-        tokenized_chat_template_dummy = tokenizer.encode(chat_template_dummy, add_special_tokens=False)
-        chat_template_len = len(tokenized_chat_template_dummy) - 1
+        if dsv4:
+            template_dummy = dsv4_encode_messages(
+                [{"role": "user", "content": "a"}],
+                thinking_mode="thinking",
+            )
+        else:
+            template_dummy = tokenizer.apply_chat_template(
+                [{"role": "user", "content": "a"}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+        tokenized_template_dummy = tokenizer.encode(template_dummy, add_special_tokens=False)
+        chat_template_len = len(tokenized_template_dummy) - 1
         input_len = input_len - chat_template_len
 
     input_lens = np.random.randint(
@@ -406,11 +414,17 @@ def sample_random_requests(
             ]
         prompt = tokenizer.decode(re_encoded_sequence)
         if use_chat_template:
-            prompt = tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=False,
-            )
+            if dsv4:
+                prompt = dsv4_encode_messages(
+                    [{"role": "user", "content": prompt}],
+                    thinking_mode="thinking",
+                )
+            else:
+                prompt = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
             input_lens[i] += chat_template_len
 
         input_requests.append((prompt, int(prefix_len + input_lens[i]),
@@ -967,6 +981,7 @@ def main(args: argparse.Namespace):
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
             use_chat_template=args.use_chat_template,
+            dsv4=args.dsv4,
         )
 
     else:
@@ -1353,5 +1368,13 @@ if __name__ == "__main__":
                         "launching the server. For each request, the "
                         "script chooses a LoRA module at random.")
 
+    dsv4_group = parser.add_argument_group("DeepSeek-V4 chat template options")
+    dsv4_group.add_argument(
+        "--dsv4",
+        action="store_true",
+        help="Use the DeepSeek-V4 chat template (encoding_dsv4.py) instead of "
+        "the tokenizer's built-in chat template. Applies to random and sonnet "
+        "datasets.",
+    )
     args = parser.parse_args()
     main(args)
